@@ -1,51 +1,56 @@
 defmodule Fetch.MixProject do
   use Mix.Project
 
+  @version "0.1.0"
+  @source_url "https://github.com/azabroflovski/fetch"
+
   def project do
     [
       app: :fetch,
-      version: "0.0.1",
-      elixir: "~> 1.0",
+      version: @version,
+      elixir: "~> 1.15",
+      elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
       deps: deps(),
-      description: description(),
+      description: "A small just-for-fun HTTP/1.1 client written in plain Elixir/OTP.",
       package: package(),
       name: "Fetch",
-      source_url: "https://github.com/azabroflovski/fetch",
-      homepage_url: "https://github.com/azabroflovski/fetch",
-      docs: &docs/0
+      source_url: @source_url,
+      homepage_url: @source_url,
+      docs: docs()
     ]
   end
 
   def application do
     [
-      extra_applications: [:logger]
+      extra_applications: [:ssl, :public_key]
     ]
   end
 
+  defp elixirc_paths(:test), do: ["lib", "test/support"]
+  defp elixirc_paths(_), do: ["lib"]
+
+  # Dev-only, never a runtime dependency. See AGENTS.md, section 8.
   defp deps do
     [
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end
 
-  defp description() do
-    "🚀 A lightweight HTTP library inspired by JavaScript's fetch, bringing simplicity and flexibility to Elixir HTTP requests."
-  end
-
-  defp package() do
+  defp package do
     [
       name: "fetch",
-      files: ~w(lib .formatter.exs mix.exs README*),
       licenses: ["MIT"],
-      links: %{"GitHub" => "https://github.com/azabroflovski/fetch"}
+      links: %{"GitHub" => @source_url},
+      files: ~w(lib mix.exs README.md CHANGELOG.md LICENSE .formatter.exs)
     ]
   end
 
   defp docs do
     [
       main: "Fetch",
-      extras: ["README.md"]
+      source_ref: "v#{@version}",
+      extras: ["README.md", "CHANGELOG.md"]
     ]
   end
 end
