@@ -195,16 +195,108 @@ defmodule Fetch.ParserTest do
       end
     end
 
-    test "transfer-encoding is not supported yet and wins over content-length" do
+    test "chunked transfer-encoding wins over content-length" do
       headers = [{"content-length", "5"}, {"transfer-encoding", "chunked"}]
 
+      assert Parser.body_framing(:get, 200, headers) == {:ok, :chunked}
+    end
+
+    test "transfer coding names are case-insensitive, empty list elements are ignored" do
+      assert Parser.body_framing(:get, 200, [{"transfer-encoding", "Chunked"}]) == {:ok, :chunked}
+
+      assert Parser.body_framing(:get, 200, [{"transfer-encoding", " chunked , "}]) ==
+               {:ok, :chunked}
+    end
+
+    test "no body for HEAD even when chunked" do
+      assert Parser.body_framing(:head, 200, [{"transfer-encoding", "chunked"}]) == {:ok, :none}
+    end
+
+    test "codings other than plain chunked are not supported" do
+      for value <- ["gzip", "gzip, chunked", "chunked, gzip", "chunked, chunked", "identity", ""] do
+        assert Parser.body_framing(:get, 200, [{"transfer-encoding", value}]) ==
+                 {:error, {:parse, {:unsupported_transfer_encoding, value}}}
+      end
+
+      headers = [{"transfer-encoding", "gzip"}, {"transfer-encoding", "chunked"}]
+
       assert Parser.body_framing(:get, 200, headers) ==
-               {:error, {:parse, {:unsupported_transfer_encoding, "chunked"}}}
+               {:error, {:parse, {:unsupported_transfer_encoding, "gzip, chunked"}}}
     end
 
     test "without length the body is delimited by connection close" do
       assert Parser.body_framing(:get, 200, [{"content-type", "text/plain"}]) ==
                {:ok, :until_close}
+    end
+  end
+
+  describe "parse_chunk_size/1" do
+    test "hexadecimal size, rest starts with the chunk data" do
+      assert Parser.parse_chunk_size("5\r\nhello\r\n") == {:ok, 5, "hello\r\n"}
+      assert Parser.parse_chunk_size("1a\r\n") == {:ok, 26, ""}
+      assert Parser.parse_chunk_size("1A\r\n") == {:ok, 26, ""}
+      assert Parser.parse_chunk_size("000F\r\n") == {:ok, 15, ""}
+      assert Parser.parse_chunk_size("FFFFFFFFFFFFFFFF\r\n") == {:ok, 0xFFFFFFFFFFFFFFFF, ""}
+    end
+
+    test "last chunk" do
+      assert Parser.parse_chunk_size("0\r\n\r\n") == {:ok, 0, "\r\n"}
+    end
+
+    test "chunk extensions and trailing whitespace are skipped" do
+      assert Parser.parse_chunk_size("5;name=value\r\n") == {:ok, 5, ""}
+      assert Parser.parse_chunk_size("5 ; name=\"quoted value\"\r\n") == {:ok, 5, ""}
+      assert Parser.parse_chunk_size("5;a;b=c\r\n") == {:ok, 5, ""}
+      assert Parser.parse_chunk_size("5 \r\n") == {:ok, 5, ""}
+    end
+
+    test "incomplete line" do
+      assert Parser.parse_chunk_size("") == :more
+      assert Parser.parse_chunk_size("5") == :more
+      assert Parser.parse_chunk_size("5\r") == :more
+      assert Parser.parse_chunk_size("5;ext") == :more
+    end
+
+    test "invalid" do
+      for line <- [
+            "",
+            " 5",
+            "x",
+            "-5",
+            "+5",
+            "0x5",
+            "5 5",
+            "5,",
+            "5\nhello",
+            "5;a\0",
+            "1FFFFFFFFFFFFFFFF"
+          ] do
+        assert Parser.parse_chunk_size(line <> "\r\n") ==
+                 {:error, {:parse, {:invalid_chunk_size, line}}}
+      end
+    end
+  end
+
+  describe "parse_trailers/1" do
+    test "no trailers" do
+      assert Parser.parse_trailers("\r\n") == {:ok, [], ""}
+      assert Parser.parse_trailers("\r\nleftover") == {:ok, [], "leftover"}
+    end
+
+    test "trailer fields" do
+      assert Parser.parse_trailers("Expires: never\r\nX-Checksum: abc\r\n\r\n") ==
+               {:ok, [{"expires", "never"}, {"x-checksum", "abc"}], ""}
+    end
+
+    test "incomplete" do
+      assert Parser.parse_trailers("") == :more
+      assert Parser.parse_trailers("\r") == :more
+      assert Parser.parse_trailers("Expires: never\r\n") == :more
+    end
+
+    test "malformed trailer" do
+      assert Parser.parse_trailers("bad trailer\r\n\r\n") ==
+               {:error, {:parse, {:invalid_header, "bad trailer"}}}
     end
   end
 

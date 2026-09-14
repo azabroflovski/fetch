@@ -11,8 +11,13 @@ defmodule Fetch.ExternalTest do
     assert byte_size(response.body) == String.to_integer(length)
   end
 
+  test "HTTPS GET to example.com (chunked at the time of writing)" do
+    assert {:ok, response} = Fetch.get("https://example.com")
+    assert response.status == 200
+    assert response.body =~ "Example Domain"
+  end
+
   test "HTTPS HEAD to example.com" do
-    # GET example.com is chunked, which arrives in Phase 3.
     assert {:ok, %Fetch.Response{status: 200, body: ""}} = Fetch.head("https://example.com")
   end
 end

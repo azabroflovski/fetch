@@ -50,6 +50,9 @@ defmodule Fetch do
   # A head bigger than this is not a normal response.
   @max_head_size 64 * 1024
 
+  # Longest chunk size line (hex size + extensions) we wait for.
+  @max_chunk_line 4 * 1024
+
   @type error_stage :: :url | :request | :dns | :connect | :tls | :send | :recv | :parse
   @type error :: {:error, {error_stage(), term()}}
 
@@ -149,22 +152,98 @@ defmodule Fetch do
 
   defp read_body(transport, {:content_length, length}, buffer, opts) do
     # Known upfront: refuse before reading a single body byte.
-    if length > opts[:max_body_size],
-      do: {:error, {:recv, :body_too_large}},
-      else: read_exactly(transport, length, buffer, opts[:receive_timeout])
+    if length > opts[:max_body_size] do
+      {:error, {:recv, :body_too_large}}
+    else
+      # Anything after `length` bytes is not part of this response. With
+      # `connection: close` there is nothing valid it could be, so it is dropped.
+      with {:ok, body, _rest} <- read_exactly(transport, length, buffer, opts[:receive_timeout]),
+           do: {:ok, body}
+    end
   end
+
+  defp read_body(transport, :chunked, buffer, opts),
+    do: read_chunks(transport, buffer, "", opts)
 
   defp read_body(transport, :until_close, buffer, opts),
     do: read_until_close(transport, buffer, opts[:max_body_size], opts[:receive_timeout])
 
-  # Anything after `length` bytes is not part of this response. With
-  # `connection: close` there is nothing valid it could be, so it is dropped.
-  defp read_exactly(_transport, length, buffer, _timeout) when byte_size(buffer) >= length,
-    do: {:ok, binary_part(buffer, 0, length)}
+  # Returns exactly `length` bytes and whatever was received after them.
+  defp read_exactly(_transport, length, buffer, _timeout) when byte_size(buffer) >= length do
+    <<bytes::binary-size(length), rest::binary>> = buffer
+    {:ok, bytes, rest}
+  end
 
   defp read_exactly(transport, length, buffer, timeout) do
     with {:ok, data} <- Transport.recv(transport, timeout) do
       read_exactly(transport, length, buffer <> data, timeout)
+    end
+  end
+
+  # A chunked body is a sequence of sized chunks, ended by a zero-size chunk
+  # and a (usually empty) trailer section:
+  #
+  #     5\r\nhello\r\n 6\r\n world\r\n 0\r\n \r\n
+  #
+  # The size comes before the data, so the body limit is checked before the
+  # data is read. Data is read by size, never by lines: it may contain CRLF.
+  defp read_chunks(transport, buffer, body, opts) do
+    case Parser.parse_chunk_size(buffer) do
+      {:ok, 0, rest} ->
+        read_trailers(transport, rest, body, opts[:receive_timeout])
+
+      {:ok, size, rest} ->
+        if byte_size(body) + size > opts[:max_body_size],
+          do: {:error, {:recv, :body_too_large}},
+          else: read_chunk(transport, size, rest, body, opts)
+
+      :more when byte_size(buffer) > @max_chunk_line ->
+        {:error, {:recv, :chunk_line_too_long}}
+
+      :more ->
+        with {:ok, data} <- Transport.recv(transport, opts[:receive_timeout]) do
+          read_chunks(transport, buffer <> data, body, opts)
+        end
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp read_chunk(transport, size, buffer, body, opts) do
+    case read_exactly(transport, size + 2, buffer, opts[:receive_timeout]) do
+      {:ok, <<data::binary-size(size), "\r\n">>, rest} ->
+        read_chunks(transport, rest, body <> data, opts)
+
+      {:ok, _data_without_crlf, _rest} ->
+        {:error, {:parse, :invalid_chunk}}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  defp read_trailers(transport, buffer, body, timeout) do
+    case Parser.parse_trailers(buffer) do
+      # Trailers are validated, then dropped: merging them into the headers is
+      # only safe for fields known to allow it (RFC 9110 §6.5.1).
+      {:ok, _trailers, _rest} ->
+        {:ok, body}
+
+      :more when byte_size(buffer) > @max_head_size ->
+        {:error, {:recv, :trailers_too_large}}
+
+      :more ->
+        case Transport.recv(transport, timeout) do
+          {:ok, data} -> read_trailers(transport, buffer <> data, body, timeout)
+          # Some servers close right after `0\r\n` without the final CRLF.
+          # The body is complete at that point, so accept it.
+          {:error, {:recv, :closed}} when buffer == "" -> {:ok, body}
+          {:error, _} = error -> error
+        end
+
+      {:error, _} = error ->
+        error
     end
   end
 

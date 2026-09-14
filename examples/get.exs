@@ -3,7 +3,7 @@
 #     mix run examples/get.exs
 #     mix run examples/get.exs http://localhost:4000/
 #
-url = List.first(System.argv()) || "https://www.erlang.org/"
+url = List.first(System.argv()) || "https://example.com"
 
 case Fetch.get(url) do
   {:ok, response} ->

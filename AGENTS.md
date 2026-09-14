@@ -89,7 +89,7 @@ Fetch.request(method, url, opts)
   │    ├─ recv until "\r\n\r\n"           (bounded head size)
   │    ├─ Fetch.Parser.parse_head/1       status line + headers
   │    ├─ skip 1xx interim responses
-  │    ├─ Fetch.Parser.body_framing/3     :none | {:content_length, n} | :until_close
+  │    ├─ Fetch.Parser.body_framing/3     :none | {:content_length, n} | :chunked | :until_close
   │    └─ recv body                        (bounded body size)
   ├─ Fetch.Transport.close/1              always, success or error
   └─ {:ok, %Fetch.Response{}} | {:error, {stage, reason}}
@@ -102,7 +102,7 @@ Fetch.request(method, url, opts)
 | `Fetch` | IO | Public API, option validation, the request lifecycle and the receive loop. |
 | `Fetch.URL` | pure | Validate a URL for HTTP use on top of `URI.new/1`. |
 | `Fetch.Request` | pure | Encode a request to iodata; reject header injection. |
-| `Fetch.Parser` | pure | Parse status line and headers; decide body framing. |
+| `Fetch.Parser` | pure | Parse status line, headers, chunk size lines and trailers; decide body framing. |
 | `Fetch.Response` | data | `%Fetch.Response{status, headers, body}` + `get_header/2`. |
 | `Fetch.Transport` | IO | DNS, TCP, TLS; `send/recv/close` over `{:gen_tcp, socket} \| {:ssl, socket}`. |
 
@@ -130,8 +130,8 @@ Every error that leaves any module is `{:error, {stage, reason}}`:
 | `:connect` | `:econnrefused`, `:timeout` |
 | `:tls` | `{:tls_alert, ...}`, `:timeout` |
 | `:send` | `:closed`, `:timeout` |
-| `:recv` | `:closed`, `:timeout`, `:head_too_large`, `:body_too_large` |
-| `:parse` | `{:invalid_status_line, line}`, `{:invalid_header, line}`, `{:invalid_content_length, value}`, `{:unsupported_transfer_encoding, value}` |
+| `:recv` | `:closed`, `:timeout`, `:head_too_large`, `:body_too_large`, `:chunk_line_too_long`, `:trailers_too_large` |
+| `:parse` | `{:invalid_status_line, line}`, `{:invalid_header, line}`, `{:invalid_content_length, value}`, `{:unsupported_transfer_encoding, value}`, `{:invalid_chunk_size, line}`, `:invalid_chunk` |
 
 A timeout is always `{stage, :timeout}`, so `{:error, {_, :timeout}}` matches
 any of them.
@@ -183,11 +183,37 @@ Response head:
 Body framing (RFC 9112 §6.3), in order:
 
 1. HEAD request, 1xx, 204, 304 → no body.
-2. `transfer-encoding` present → Phase 1/2: error `unsupported_transfer_encoding`.
+2. `transfer-encoding` present → must be exactly `chunked` (case-insensitive,
+   possibly split across headers or commas) → chunked, ignoring
+   `content-length`. Any other coding list (`gzip, chunked`, ...) → error
+   `unsupported_transfer_encoding` until compression exists.
 3. `content-length` → exactly N bytes. Multiple or comma-separated values are
    accepted only when all equal (response smuggling protection). Bytes after N
    are discarded.
 4. Otherwise → read until the server closes the connection.
+
+Chunked bodies (RFC 9112 §7.1):
+
+```text
+chunk-size-in-hex [;extensions] CRLF
+chunk-data CRLF
+... more chunks ...
+0 CRLF
+[trailer fields CRLF]
+CRLF
+```
+
+- Size: 1–16 hex digits. Whitespace after the size is tolerated. Extensions
+  must not contain CR/LF/NUL and are ignored.
+- Size line limit 4 KiB (`{:recv, :chunk_line_too_long}`).
+- `:max_body_size` is checked against the declared size before reading data.
+- Chunk data is read by size, never by lines (it may contain CRLF), and must
+  be followed by CRLF, otherwise `{:parse, :invalid_chunk}`.
+- Trailer fields are parsed like headers, then dropped: merging them into
+  headers is only safe for fields known to allow it (RFC 9110 §6.5.1).
+  Limit 64 KiB.
+- A connection closed right after `0\r\n` (final CRLF missing) is accepted:
+  the body is already complete.
 
 **Forbidden shortcuts:** `packet: :http`, `packet: :http_bin`,
 `:erlang.decode_packet/3` and any other ready-made HTTP parser. They are exactly
@@ -254,14 +280,10 @@ MVP (Phases 1–2):
 | 0 | Research, design, this document | done |
 | 1 | URL, TCP, request encoding, response parsing, Content-Length | done |
 | 2 | HTTPS, errors, timeouts, tests | done |
-| 3 | `Transfer-Encoding: chunked`; redirects (301/302/303/307/308, `follow_redirects`, `max_redirects`) | next |
+| 3 | `Transfer-Encoding: chunked` (done); redirects (301/302/303/307/308, `follow_redirects`, `max_redirects`) | in progress |
 | 4 | Keep-alive on a single connection (connect → req → resp → req → resp → close) | |
 | 5 | Streaming responses | |
 | 6 | Optional: gzip/deflate, benchmarks vs other clients (as an experiment) | |
-
-Note for Phase 3: `https://example.com` currently answers HTTP/1.1 requests with
-`Transfer-Encoding: chunked` (Cloudflare), so chunked decoding is needed for it
-to return a body.
 
 After every phase: tests → review → simplify → remove unnecessary abstractions →
 update this file and `CHANGELOG.md`.
@@ -269,8 +291,8 @@ update this file and `CHANGELOG.md`.
 ## 7. Educational vs production-oriented parts
 
 - **Educational (written by hand, clarity over speed):** request encoding,
-  status line / header parsing, body framing, the receive loop, later chunked
-  decoding and keep-alive.
+  status line / header parsing, body framing, the receive loop, chunked
+  decoding, later keep-alive.
 - **Production-oriented (must be correct and safe, never "simplified away"):**
   TLS verification and hostname checks, header injection protection,
   Content-Length conflict handling, size limits, timeouts, always closing

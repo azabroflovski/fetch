@@ -27,7 +27,10 @@ defmodule Fetch.Parser do
           reason: String.t(),
           headers: headers()
         }
-  @type framing :: :none | {:content_length, non_neg_integer()} | :until_close
+  @type framing :: :none | {:content_length, non_neg_integer()} | :chunked | :until_close
+
+  # 16 hex digits already mean 2^64 - 1 bytes; longer sizes are nonsense.
+  @max_chunk_size_digits 16
 
   @doc """
   Splits a buffer at the end of the head.
@@ -149,7 +152,8 @@ defmodule Fetch.Parser do
   Decides how the response body is delimited (RFC 9112 §6.3).
 
     1. responses to HEAD, and 1xx/204/304 responses have no body
-    2. `transfer-encoding` wins over `content-length` — not supported yet
+    2. `transfer-encoding` wins over `content-length`; only plain `chunked`
+       is supported
     3. `content-length` gives the exact size
     4. otherwise the body lasts until the server closes the connection
   """
@@ -159,8 +163,8 @@ defmodule Fetch.Parser do
       method == :head or status in 100..199 or status in [204, 304] ->
         {:ok, :none}
 
-      te = header_values(headers, "transfer-encoding") |> List.first() ->
-        {:error, {:parse, {:unsupported_transfer_encoding, te}}}
+      (codings = header_values(headers, "transfer-encoding")) != [] ->
+        transfer_encoding(codings)
 
       (lengths = header_values(headers, "content-length")) != [] ->
         content_length(lengths)
@@ -170,15 +174,26 @@ defmodule Fetch.Parser do
     end
   end
 
+  # Transfer codings are applied in order and `chunked` must be the last one.
+  # Anything but `chunked` alone (e.g. `gzip, chunked`) needs decompression,
+  # which does not exist yet.
+  defp transfer_encoding(values) do
+    codings =
+      values
+      |> split_list()
+      |> Enum.map(&String.downcase(&1, :ascii))
+      |> Enum.reject(&(&1 == ""))
+
+    if codings == ["chunked"],
+      do: {:ok, :chunked},
+      else: {:error, {:parse, {:unsupported_transfer_encoding, Enum.join(values, ", ")}}}
+  end
+
   # `Content-Length: 5, 5` or two `Content-Length: 5` headers are allowed only
   # if all values agree. Different values mean client and server may disagree on
   # where the body ends — the basis of response smuggling (RFC 9112 §6.3).
   defp content_length(values) do
-    values
-    |> Enum.flat_map(&:binary.split(&1, ",", [:global]))
-    |> Enum.map(&trim_ows/1)
-    |> Enum.uniq()
-    |> case do
+    case values |> split_list() |> Enum.uniq() do
       [value] ->
         if digits?(value),
           do: {:ok, {:content_length, String.to_integer(value)}},
@@ -186,6 +201,63 @@ defmodule Fetch.Parser do
 
       values ->
         {:error, {:parse, {:invalid_content_length, Enum.join(values, ", ")}}}
+    end
+  end
+
+  # A header may carry a comma-separated list, and repeating the header is the
+  # same as joining its values with commas (RFC 9110 §5.3).
+  defp split_list(values) do
+    values
+    |> Enum.flat_map(&:binary.split(&1, ",", [:global]))
+    |> Enum.map(&trim_ows/1)
+  end
+
+  @doc """
+  Parses the size line at the start of a chunk (RFC 9112 §7.1):
+
+      chunk-size [ chunk-ext ] CRLF      <- this line
+      chunk-data CRLF
+
+  The size is hexadecimal. Chunk extensions (`;name=value`) have no meaning
+  for us and are skipped. Returns the size and the bytes after the line.
+  A size of 0 marks the last chunk, followed by the trailer section.
+  """
+  @spec parse_chunk_size(binary()) ::
+          {:ok, non_neg_integer(), binary()} | :more | {:error, {:parse, term()}}
+  def parse_chunk_size(buffer) do
+    with [line, rest] <- :binary.split(buffer, "\r\n") do
+      digits = hex_digits(line, 0)
+      <<hex::binary-size(digits), extensions::binary>> = line
+
+      if digits in 1..@max_chunk_size_digits and chunk_extensions?(trim_leading(extensions)),
+        do: {:ok, String.to_integer(hex, 16), rest},
+        else: {:error, {:parse, {:invalid_chunk_size, line}}}
+    else
+      [_incomplete] -> :more
+    end
+  end
+
+  defp hex_digits(<<c, rest::binary>>, count) when c in ?0..?9 or c in ?a..?f or c in ?A..?F,
+    do: hex_digits(rest, count + 1)
+
+  defp hex_digits(_line, count), do: count
+
+  defp chunk_extensions?(""), do: true
+  defp chunk_extensions?(<<";", extensions::binary>>), do: field_value?(extensions)
+  defp chunk_extensions?(_other), do: false
+
+  @doc """
+  Parses the trailer section after the last chunk: header lines followed by
+  an empty line. Usually there are no trailers and the section is just CRLF.
+  """
+  @spec parse_trailers(binary()) ::
+          {:ok, headers(), binary()} | :more | {:error, {:parse, term()}}
+  def parse_trailers(<<"\r\n", rest::binary>>), do: {:ok, [], rest}
+
+  def parse_trailers(buffer) do
+    with {:ok, section, rest} <- split_head(buffer),
+         {:ok, trailers} <- parse_headers(:binary.split(section, "\r\n", [:global])) do
+      {:ok, trailers, rest}
     end
   end
 

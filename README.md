@@ -91,6 +91,9 @@ Fetch.Response.get_header(response, "Set-Cookie")
 Header names are lowercased; order and duplicates are kept. Any status code,
 including 4xx and 5xx, is `{:ok, response}`.
 
+The body is read whole, whether it is framed by `content-length`,
+`transfer-encoding: chunked` or by the server closing the connection.
+
 ## Errors
 
 ```elixir
@@ -133,15 +136,15 @@ then is not stopped by `:receive_timeout`.
 
 - New connection for every request, no keep-alive, no pooling.
 - The whole body is kept in memory. No streaming.
-- `Transfer-Encoding: chunked` is not supported yet
-  (`{:error, {:parse, {:unsupported_transfer_encoding, "chunked"}}}`).
-  Many servers use it, including `https://example.com`.
+- `chunked` is the only transfer coding. `gzip, chunked` and friends return
+  `{:error, {:parse, {:unsupported_transfer_encoding, value}}}`.
+- Trailer fields of chunked responses are validated and dropped.
 - No redirects, compression, cookies, proxies, retries.
 - HTTP/1.1 only.
 
 ## Roadmap
 
-1. Chunked transfer encoding, redirects
+1. Redirects
 2. Keep-alive on a single connection
 3. Streaming responses
 4. Optional: gzip/deflate, benchmarks

@@ -139,6 +139,115 @@ defmodule FetchTest do
     end
   end
 
+  describe "chunked transfer encoding" do
+    @chunked "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+
+    test "decodes chunks" do
+      url = serve(@chunked <> "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n")
+
+      assert {:ok, %Response{status: 200, headers: [{"transfer-encoding", "chunked"}]} = response} =
+               Fetch.get(url)
+
+      assert response.body == "hello world"
+    end
+
+    test "empty body" do
+      url = serve(@chunked <> "0\r\n\r\n")
+      assert {:ok, %Response{body: ""}} = Fetch.get(url)
+    end
+
+    test "chunk data is binary and may contain CRLF" do
+      data = "a\r\n0\r\n\r\nb" <> <<0, 255>>
+      size = Integer.to_string(byte_size(data), 16)
+      url = serve(@chunked <> size <> "\r\n" <> data <> "\r\n0\r\n\r\n")
+
+      assert {:ok, %Response{body: ^data}} = Fetch.get(url)
+    end
+
+    test "chunk extensions and trailers are ignored" do
+      url =
+        serve(
+          @chunked <> "5;name=value\r\nhello\r\n0\r\nExpires: never\r\nX-Checksum: abc\r\n\r\n"
+        )
+
+      assert {:ok, %Response{body: "hello", headers: [{"transfer-encoding", "chunked"}]}} =
+               Fetch.get(url)
+    end
+
+    test "response split into tiny TCP chunks" do
+      response = @chunked <> "3\r\nabc\r\n2;x=y\r\nde\r\n0\r\nX-T: 1\r\n\r\n"
+      url = serve(for <<byte <- response>>, do: <<byte>>)
+
+      assert {:ok, %Response{body: "abcde"}} = Fetch.get(url)
+    end
+
+    test "large chunk across many reads" do
+      data = :crypto.strong_rand_bytes(300_000)
+      size = Integer.to_string(byte_size(data), 16)
+      url = serve([@chunked <> size <> "\r\n", data, "\r\n1\r\n!\r\n0\r\n\r\n"])
+
+      assert {:ok, %Response{body: body}} = Fetch.get(url)
+      assert body == data <> "!"
+    end
+
+    test "connection closed right after the last chunk is accepted" do
+      url = serve(@chunked <> "5\r\nhello\r\n0\r\n")
+      assert {:ok, %Response{body: "hello"}} = Fetch.get(url)
+    end
+
+    test "connection closed in the middle of a chunk" do
+      url = serve(@chunked <> "A\r\nhello")
+      assert Fetch.get(url) == {:error, {:recv, :closed}}
+    end
+
+    test "connection closed before the last chunk" do
+      url = serve(@chunked <> "5\r\nhello\r\n")
+      assert Fetch.get(url) == {:error, {:recv, :closed}}
+    end
+
+    test "invalid chunk size" do
+      url = serve(@chunked <> "zz\r\nhello\r\n0\r\n\r\n")
+      assert Fetch.get(url) == {:error, {:parse, {:invalid_chunk_size, "zz"}}}
+    end
+
+    test "chunk data longer than its declared size" do
+      url = serve(@chunked <> "3\r\nhello\r\n0\r\n\r\n")
+      assert Fetch.get(url) == {:error, {:parse, :invalid_chunk}}
+    end
+
+    test "malformed trailer" do
+      url = serve(@chunked <> "0\r\nbad trailer\r\n\r\n")
+      assert Fetch.get(url) == {:error, {:parse, {:invalid_header, "bad trailer"}}}
+    end
+
+    test "declared chunk size above max_body_size is refused before reading" do
+      url = serve(@chunked <> "FFFFFFFF\r\n")
+      assert Fetch.get(url, max_body_size: 1_000) == {:error, {:recv, :body_too_large}}
+    end
+
+    test "sum of chunks above max_body_size" do
+      url = serve(@chunked <> "6\r\n123456\r\n6\r\n789012\r\n0\r\n\r\n")
+      assert Fetch.get(url, max_body_size: 10) == {:error, {:recv, :body_too_large}}
+    end
+
+    test "endless chunk size line" do
+      url = serve(@chunked <> String.duplicate("1", 5_000))
+      assert Fetch.get(url) == {:error, {:recv, :chunk_line_too_long}}
+    end
+
+    test "receive timeout between chunks" do
+      port =
+        TestServer.start(fn {mod, socket} = conn ->
+          TestServer.read_request(conn)
+          mod.send(socket, @chunked <> "5\r\nhello\r\n")
+          Process.sleep(500)
+        end)
+
+      assert Fetch.get("http://localhost:#{port}", receive_timeout: 50) ==
+               {:error, {:recv, :timeout}}
+    end
+  end
+
   describe "malformed responses" do
     test "invalid status line" do
       url = serve("HTTP/1.1 OK\r\n\r\n")
@@ -160,9 +269,11 @@ defmodule FetchTest do
       assert Fetch.get(url) == {:error, {:parse, {:invalid_content_length, "5, 50"}}}
     end
 
-    test "chunked is not supported yet" do
-      url = serve("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
-      assert Fetch.get(url) == {:error, {:parse, {:unsupported_transfer_encoding, "chunked"}}}
+    test "transfer codings other than chunked are not supported" do
+      url = serve("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n")
+
+      assert Fetch.get(url) ==
+               {:error, {:parse, {:unsupported_transfer_encoding, "gzip, chunked"}}}
     end
 
     test "connection closed before the head is complete" do

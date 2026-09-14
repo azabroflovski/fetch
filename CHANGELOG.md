@@ -25,3 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `:connect`, `:tls`, `:send`, `:recv`, `:parse`.
 - `:connect_timeout`, `:receive_timeout`, `:max_body_size` and `:ssl` options;
   64 KiB response head limit.
+- `Transfer-Encoding: chunked` response bodies: chunk extensions ignored,
+  trailers validated and dropped, `:max_body_size` checked against declared
+  chunk sizes before reading, 4 KiB chunk size line limit. Other transfer
+  codings return `{:parse, {:unsupported_transfer_encoding, value}}`.
