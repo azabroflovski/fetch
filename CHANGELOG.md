@@ -35,3 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   body. Relative `location` is resolved against the requested URL.
   `authorization`, `proxy-authorization` and `cookie` are not sent to another
   origin. New error stage `:redirect`.
+- `Fetch.Conn`: keep-alive on a single connection with `new/2`, `request/4`
+  (returns the updated connection) and `close/1`. The socket is reused
+  according to RFC 9112 §9.3; an idle connection closed by the server is
+  detected before sending and replaced. Requests already sent are never
+  retried. `Fetch.request/3` is built on it and still uses one connection per
+  request with `connection: close`.

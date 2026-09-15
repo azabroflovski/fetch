@@ -57,6 +57,17 @@ defmodule Fetch.Transport do
     :ok
   end
 
+  @doc """
+  Checks, without waiting, that an idle connection can be reused: still open
+  and nothing unread. A server that closed it, or sent something on its own
+  (like `408 Request Timeout` before closing), makes it unusable.
+  """
+  @spec idle?(t()) :: boolean()
+  def idle?({module, socket}) do
+    # With a zero timeout, :timeout means "open, nothing to read".
+    module.recv(socket, 0, 0) == {:error, :timeout}
+  end
+
   # An IP literal needs no lookup. Otherwise ask for IPv4 addresses first and
   # fall back to IPv6. (Racing both is "happy eyeballs", a non-goal.)
   defp resolve(host, timeout) do

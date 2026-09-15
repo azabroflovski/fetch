@@ -6,19 +6,22 @@ defmodule Fetch do
       response.status
       #=> 200
 
-  Every request opens a new connection, sends one request with
+  Every call opens a new connection, sends one request with
   `connection: close`, reads the response and closes the connection:
 
       URL → DNS → TCP → (TLS) → request → response head → body → close
+
+  To send several requests over one connection (keep-alive), use
+  `Fetch.Conn`.
 
   ## Options
 
     * `:headers` — list of `{name, value}` tuples. Default `[]`.
     * `:body` — request body as iodata. Default `nil`.
     * `:connect_timeout` — ms, applied to each of DNS lookup, TCP connect and
-      TLS handshake. Default `#{5_000}`.
+      TLS handshake. Default `5_000`.
     * `:receive_timeout` — ms, the longest the server may stay silent while we
-      wait for bytes (and while a send is blocked). Default `#{15_000}`.
+      wait for bytes (and while a send is blocked). Default `15_000`.
     * `:max_body_size` — bytes. Larger responses fail with
       `{:recv, :body_too_large}`. Default 16 MiB.
     * `:ssl` — extra `:ssl` client options merged over the secure defaults,
@@ -38,26 +41,12 @@ defmodule Fetch do
   bugs in the calling code, not runtime conditions.
   """
 
-  alias Fetch.{Parser, Redirect, Request, Response, Transport, URL}
+  alias Fetch.{Conn, Redirect, Request, Response, URL}
 
-  @methods [:get, :head, :post, :put, :patch, :delete, :options]
+  # Passed on to `Fetch.Conn.new/2`, which validates them and owns the defaults.
+  @connection_options [:connect_timeout, :receive_timeout, :max_body_size, :ssl]
 
-  @default_options [
-    headers: [],
-    body: nil,
-    connect_timeout: 5_000,
-    receive_timeout: 15_000,
-    max_body_size: 16 * 1024 * 1024,
-    ssl: [],
-    follow_redirects: true,
-    max_redirects: 10
-  ]
-
-  # A head bigger than this is not a normal response.
-  @max_head_size 64 * 1024
-
-  # Longest chunk size line (hex size + extensions) we wait for.
-  @max_chunk_line 4 * 1024
+  @default_options [headers: [], body: nil, follow_redirects: true, max_redirects: 10]
 
   @type error_stage ::
           :url | :request | :dns | :connect | :tls | :send | :recv | :parse | :redirect
@@ -102,189 +91,41 @@ defmodule Fetch do
   """
   @spec request(Request.method(), String.t(), keyword()) :: {:ok, Response.t()} | error()
   def request(method, url, opts \\ []) do
-    if method not in @methods do
-      raise ArgumentError,
-            "unsupported method #{inspect(method)}, expected one of #{inspect(@methods)}"
-    end
-
+    Request.check_method!(method)
+    {conn_opts, opts} = Keyword.split(opts, @connection_options)
     opts = Keyword.validate!(opts, @default_options)
 
     with {:ok, url} <- URL.parse(url) do
       request = %{method: method, url: url, headers: opts[:headers], body: opts[:body]}
-      run(request, opts, opts[:max_redirects])
+      run(request, conn_opts, opts, opts[:max_redirects])
     end
   end
 
   # Every redirect is a new request on a new connection.
-  defp run(request, opts, redirects_left) do
-    with {:ok, response} <- send_request(request, opts) do
+  defp run(request, conn_opts, opts, redirects_left) do
+    with {:ok, response} <- send_once(request, conn_opts) do
       next = if opts[:follow_redirects], do: Redirect.next_request(request, response), else: :none
 
       case next do
         :none -> {:ok, response}
         {:ok, _next} when redirects_left < 1 -> {:error, {:redirect, :too_many_redirects}}
-        {:ok, next} -> run(next, opts, redirects_left - 1)
+        {:ok, next} -> run(next, conn_opts, opts, redirects_left - 1)
         {:error, _} = error -> error
       end
     end
   end
 
-  defp send_request(%{method: method, url: url} = request, opts) do
-    with {:ok, data} <- Request.encode(method, url, request.headers, request.body),
-         {:ok, transport} <- Transport.connect(url, opts) do
-      try do
-        with :ok <- Transport.send(transport, data) do
-          read_response(transport, "", method, opts)
-        end
-      after
-        Transport.close(transport)
-      end
-    end
-  end
+  # One request on a fresh connection; `keep_alive: false` closes it afterwards.
+  defp send_once(request, conn_opts) do
+    {:ok, conn} = Conn.new(request.url, conn_opts)
 
-  defp read_response(transport, buffer, method, opts) do
-    with {:ok, head, rest} <- read_head(transport, buffer, opts[:receive_timeout]),
-         {:ok, %{status: status, headers: headers}} <- Parser.parse_head(head) do
-      if status in 100..199 do
-        # Interim response (e.g. 100 Continue): the real one follows.
-        read_response(transport, rest, method, opts)
-      else
-        with {:ok, framing} <- Parser.body_framing(method, status, headers),
-             {:ok, body} <- read_body(transport, framing, rest, opts) do
-          {:ok, %Response{status: status, headers: headers, body: body}}
-        end
-      end
-    end
-  end
-
-  # TCP is a byte stream: one recv may return half a header line or the head
-  # together with part of the body. Accumulate until the empty line shows up.
-  defp read_head(transport, buffer, timeout) do
-    case Parser.split_head(buffer) do
-      {:ok, head, _rest} when byte_size(head) > @max_head_size ->
-        {:error, {:recv, :head_too_large}}
-
-      {:ok, head, rest} ->
-        {:ok, head, rest}
-
-      :more when byte_size(buffer) > @max_head_size ->
-        {:error, {:recv, :head_too_large}}
-
-      :more ->
-        with {:ok, data} <- Transport.recv(transport, timeout) do
-          read_head(transport, buffer <> data, timeout)
-        end
-    end
-  end
-
-  defp read_body(_transport, :none, _buffer, _opts), do: {:ok, ""}
-
-  defp read_body(transport, {:content_length, length}, buffer, opts) do
-    # Known upfront: refuse before reading a single body byte.
-    if length > opts[:max_body_size] do
-      {:error, {:recv, :body_too_large}}
-    else
-      # Anything after `length` bytes is not part of this response. With
-      # `connection: close` there is nothing valid it could be, so it is dropped.
-      with {:ok, body, _rest} <- read_exactly(transport, length, buffer, opts[:receive_timeout]),
-           do: {:ok, body}
-    end
-  end
-
-  defp read_body(transport, :chunked, buffer, opts),
-    do: read_chunks(transport, buffer, "", opts)
-
-  defp read_body(transport, :until_close, buffer, opts),
-    do: read_until_close(transport, buffer, opts[:max_body_size], opts[:receive_timeout])
-
-  # Returns exactly `length` bytes and whatever was received after them.
-  defp read_exactly(_transport, length, buffer, _timeout) when byte_size(buffer) >= length do
-    <<bytes::binary-size(length), rest::binary>> = buffer
-    {:ok, bytes, rest}
-  end
-
-  defp read_exactly(transport, length, buffer, timeout) do
-    with {:ok, data} <- Transport.recv(transport, timeout) do
-      read_exactly(transport, length, buffer <> data, timeout)
-    end
-  end
-
-  # A chunked body is a sequence of sized chunks, ended by a zero-size chunk
-  # and a (usually empty) trailer section:
-  #
-  #     5\r\nhello\r\n 6\r\n world\r\n 0\r\n \r\n
-  #
-  # The size comes before the data, so the body limit is checked before the
-  # data is read. Data is read by size, never by lines: it may contain CRLF.
-  defp read_chunks(transport, buffer, body, opts) do
-    case Parser.parse_chunk_size(buffer) do
-      {:ok, 0, rest} ->
-        read_trailers(transport, rest, body, opts[:receive_timeout])
-
-      {:ok, size, rest} ->
-        if byte_size(body) + size > opts[:max_body_size],
-          do: {:error, {:recv, :body_too_large}},
-          else: read_chunk(transport, size, rest, body, opts)
-
-      :more when byte_size(buffer) > @max_chunk_line ->
-        {:error, {:recv, :chunk_line_too_long}}
-
-      :more ->
-        with {:ok, data} <- Transport.recv(transport, opts[:receive_timeout]) do
-          read_chunks(transport, buffer <> data, body, opts)
-        end
-
-      {:error, _} = error ->
-        error
-    end
-  end
-
-  defp read_chunk(transport, size, buffer, body, opts) do
-    case read_exactly(transport, size + 2, buffer, opts[:receive_timeout]) do
-      {:ok, <<data::binary-size(size), "\r\n">>, rest} ->
-        read_chunks(transport, rest, body <> data, opts)
-
-      {:ok, _data_without_crlf, _rest} ->
-        {:error, {:parse, :invalid_chunk}}
-
-      {:error, _} = error ->
-        error
-    end
-  end
-
-  defp read_trailers(transport, buffer, body, timeout) do
-    case Parser.parse_trailers(buffer) do
-      # Trailers are validated, then dropped: merging them into the headers is
-      # only safe for fields known to allow it (RFC 9110 §6.5.1).
-      {:ok, _trailers, _rest} ->
-        {:ok, body}
-
-      :more when byte_size(buffer) > @max_head_size ->
-        {:error, {:recv, :trailers_too_large}}
-
-      :more ->
-        case Transport.recv(transport, timeout) do
-          {:ok, data} -> read_trailers(transport, buffer <> data, body, timeout)
-          # Some servers close right after `0\r\n` without the final CRLF.
-          # The body is complete at that point, so accept it.
-          {:error, {:recv, :closed}} when buffer == "" -> {:ok, body}
-          {:error, _} = error -> error
-        end
-
-      {:error, _} = error ->
-        error
-    end
-  end
-
-  defp read_until_close(_transport, buffer, max_size, _timeout)
-       when byte_size(buffer) > max_size,
-       do: {:error, {:recv, :body_too_large}}
-
-  defp read_until_close(transport, buffer, max_size, timeout) do
-    case Transport.recv(transport, timeout) do
-      {:ok, data} -> read_until_close(transport, buffer <> data, max_size, timeout)
-      {:error, {:recv, :closed}} -> {:ok, buffer}
-      {:error, _} = error -> error
+    case Conn.request(conn, request.method, request.url.target,
+           headers: request.headers,
+           body: request.body,
+           keep_alive: false
+         ) do
+      {:ok, _closed_conn, response} -> {:ok, response}
+      {:error, _closed_conn, reason} -> {:error, reason}
     end
   end
 end

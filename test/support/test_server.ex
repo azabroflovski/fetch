@@ -65,7 +65,10 @@ defmodule Fetch.TestServer do
     }
   end
 
-  @doc "Reads a request: the head and a content-length body. Test-only, naive."
+  @doc """
+  Reads a request: the head and a content-length body. Returns `:closed` if
+  the client closes the connection (or stays silent) first. Test-only, naive.
+  """
   def read_request({module, socket}), do: read_request(module, socket, "")
 
   defp read_request(module, socket, buffer) do
@@ -75,8 +78,10 @@ defmodule Fetch.TestServer do
       buffer
     else
       _ ->
-        {:ok, data} = module.recv(socket, 0, 5_000)
-        read_request(module, socket, buffer <> data)
+        case module.recv(socket, 0, 5_000) do
+          {:ok, data} -> read_request(module, socket, buffer <> data)
+          {:error, _closed_or_timeout} -> :closed
+        end
     end
   end
 

@@ -8,7 +8,7 @@ defmodule Fetch.RequestTest do
   defp encode(method, url, headers \\ [], body \\ nil) do
     {:ok, url} = Fetch.URL.parse(url)
 
-    with {:ok, iodata} <- Request.encode(method, url, headers, body) do
+    with {:ok, iodata} <- Request.encode(method, url, headers, body, false) do
       {:ok, IO.iodata_to_binary(iodata)}
     end
   end
@@ -21,6 +21,24 @@ defmodule Fetch.RequestTest do
                 @ua <>
                 "connection: close\r\n" <>
                 "\r\n"}
+  end
+
+  test "keep-alive requests send no connection header" do
+    {:ok, url} = Fetch.URL.parse("http://example.com")
+    assert {:ok, iodata} = Request.encode(:get, url, [], nil, true)
+
+    assert IO.iodata_to_binary(iodata) ==
+             "GET / HTTP/1.1\r\nhost: example.com\r\n" <> @ua <> "\r\n"
+  end
+
+  test "check_method!/1" do
+    for method <- [:get, :head, :post, :put, :patch, :delete, :options] do
+      assert Request.check_method!(method) == :ok
+    end
+
+    assert_raise ArgumentError, ~r/unsupported method :trace/, fn ->
+      Request.check_method!(:trace)
+    end
   end
 
   test "POST with headers and body" do

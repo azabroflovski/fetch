@@ -76,23 +76,32 @@ Trade-offs of A that we accept for now:
 These are exactly the problems that later phases (keep-alive, streaming) will
 solve, and we want to feel them first.
 
+**Phase 4 update.** Keep-alive moved towards B without its costs: a
+`%Fetch.Conn{}` value returned by every request, still a passive socket and no
+processes. The one-shot API became "new connection value + one request with
+`keep_alive: false`", so there is a single receive loop. See 3.10.
+
 ### 3.2 Request lifecycle
 
 ```text
-Fetch.request(method, url, opts)
+Fetch.request(method, url, opts)                 one-shot API
   │
-  ├─ Fetch.URL.parse/1           "https://h:8443/a?b" → %{scheme, host, port, authority, target}
-  ├─ Fetch.Request.encode/4      method + url + headers + body → iodata (validated)
-  ├─ Fetch.Transport.connect/2   DNS (:inet) → TCP (:gen_tcp) → TLS (:ssl, https only)
-  ├─ Fetch.Transport.send/2
-  ├─ receive loop (in Fetch)
-  │    ├─ recv until "\r\n\r\n"           (bounded head size)
-  │    ├─ Fetch.Parser.parse_head/1       status line + headers
-  │    ├─ skip 1xx interim responses
-  │    ├─ Fetch.Parser.body_framing/3     :none | {:content_length, n} | :chunked | :until_close
-  │    └─ recv body                        (bounded body size)
-  ├─ Fetch.Transport.close/1              always, success or error
-  ├─ Fetch.Redirect.next_request/2        3xx + location → start over with the next request
+  ├─ Fetch.URL.parse/1                "https://h:8443/a?b" → %{scheme, host, port, authority, target}
+  ├─ Fetch.Conn.new/2                 connection value for the origin, no IO
+  ├─ Fetch.Conn.request/4             keep_alive: false
+  │    ├─ Fetch.URL.parse_target/1         "/a?b"
+  │    ├─ Fetch.Request.encode/5           method + url + headers + body → iodata (validated)
+  │    ├─ connect if no socket             Transport.connect/2: DNS → TCP → TLS (https only)
+  │    │  reused socket                    Transport.idle?/1, reconnect if closed by the server
+  │    ├─ Fetch.Transport.send/2
+  │    ├─ receive loop
+  │    │    ├─ recv until "\r\n\r\n"           (bounded head size)
+  │    │    ├─ Fetch.Parser.parse_head/1       status line + headers
+  │    │    ├─ skip 1xx interim responses
+  │    │    ├─ Fetch.Parser.body_framing/3     :none | {:content_length, n} | :chunked | :until_close
+  │    │    └─ recv body                        (bounded body size)
+  │    └─ keep the socket (Parser.keep_alive?/2, see 3.10) or close it; close on any error
+  ├─ Fetch.Redirect.next_request/2    3xx + location → start over with the next request
   └─ {:ok, %Fetch.Response{}} | {:error, {stage, reason}}
 ```
 
@@ -100,13 +109,14 @@ Fetch.request(method, url, opts)
 
 | Module | Kind | Responsibility |
 | --- | --- | --- |
-| `Fetch` | IO | Public API, option validation, the request lifecycle and the receive loop. |
+| `Fetch` | IO | One-shot public API, option validation, the redirect loop. |
+| `Fetch.Conn` | IO | A connection value: connect/reconnect, send, the receive loop, keep-alive decisions. |
 | `Fetch.URL` | pure | Validate a URL for HTTP use on top of `URI.new/1`. |
 | `Fetch.Request` | pure | Encode a request to iodata; reject header injection. |
 | `Fetch.Parser` | pure | Parse status line, headers, chunk size lines and trailers; decide body framing. |
 | `Fetch.Response` | data | `%Fetch.Response{status, headers, body}` + `get_header/2`. |
 | `Fetch.Redirect` | pure | Decide whether a response is a redirect to follow and build the next request. |
-| `Fetch.Transport` | IO | DNS, TCP, TLS; `send/recv/close` over `{:gen_tcp, socket} \| {:ssl, socket}`. |
+| `Fetch.Transport` | IO | DNS, TCP, TLS; `send/recv/close` and non-blocking `idle?/1` over `{:gen_tcp, socket} \| {:ssl, socket}`. |
 
 Transport "polymorphism" is a tuple `{module, socket}` where module is
 `:gen_tcp` or `:ssl` — both expose `send/2`, `recv/3`, `close/1`. No behaviour,
@@ -139,6 +149,10 @@ Every error that leaves any module is `{:error, {stage, reason}}`:
 A timeout is always `{stage, :timeout}`, so `{:error, {_, :timeout}}` matches
 any of them.
 
+`Fetch.Conn.request/4` returns `{:error, conn, {stage, reason}}`: the same
+reason plus the connection to continue with (closed after network errors).
+It adds `{:url, {:invalid_path, path}}`.
+
 Exceptions are only for **programmer errors**: unknown options, unsupported
 method atom, wrong argument types. Anything that depends on data or the network
 returns an error tuple. No exception hierarchy.
@@ -167,7 +181,8 @@ Request:
 - `host` = host, plus `:port` if non-default; IPv6 in brackets.
 - `content-length` when a body is given, and `0` for POST/PUT/PATCH without
   body.
-- `connection: close` (until keep-alive is implemented).
+- `connection: close` only with `keep_alive: false` (every one-shot request);
+  no `connection` header otherwise, persistent is the HTTP/1.1 default.
 - `user-agent: fetch/<version>` unless the user sets `user-agent`.
 - Header names must be RFC 9110 tokens; values must not contain CR, LF or NUL
   (header/request splitting protection).
@@ -280,6 +295,43 @@ each request on a new connection and returns the last response.
 - The 3xx body is read fully before following (connection close anyway).
 - The response does not record the final URL (not needed yet).
 
+### 3.10 Keep-alive
+
+`Fetch.Conn` is a struct `%{url, opts, transport}`; `transport` is `nil` when
+there is no socket. Every `request/4` returns the updated struct.
+
+A GenServer owning the socket was considered and rejected: requests on one
+connection are sequential and come from one process, so nothing has to be
+shared or outlive the caller. A process becomes justified only when a
+connection must be shared (pooling), which is a non-goal for now.
+
+The socket is kept after a response only if all of these hold (RFC 9112 §9.3):
+
+- the request was not `keep_alive: false`;
+- the response is HTTP/1.1 and its `connection` header has no `close` token
+  (HTTP/1.0 `keep-alive` is not supported);
+- the body was not delimited by close, and a chunked body was terminated with
+  its final CRLF;
+- no bytes arrived after the response (otherwise client and server disagree
+  about message boundaries);
+- no error happened.
+
+Otherwise the socket is closed and the next request connects again.
+
+Before sending on a reused socket, `Transport.idle?/1` calls
+`recv(socket, 0, 0)`: `{:error, :timeout}` means open and silent. `:closed` or
+unsolicited bytes (e.g. a `408` sent before the server closes) → close and
+reconnect. This is safe because nothing was sent. When the server closes while
+our request is already on the wire, the error is returned and never retried
+automatically: the request may not be idempotent.
+
+`new/2` does no IO; option validation (raise) and URL errors happen there,
+network errors come from the first request.
+
+Not implemented: pipelining, pools, sharing a connection between processes,
+automatic retries, redirects on `Fetch.Conn` (a connection is bound to one
+origin).
+
 ## 4. Scope
 
 MVP (Phases 1–2):
@@ -298,6 +350,7 @@ MVP (Phases 1–2):
 - Competing with Req/Finch/Mint on features or performance.
 - HTTP/2 (possible separate project stage later), HTTP/3/QUIC (never).
 - Connection pools (unless a real need appears after keep-alive).
+- HTTP pipelining; automatic retries of requests that were already sent.
 - Cookie jar, caching, retries, auth helpers, JSON encoding/decoding,
   multipart, proxies, a middleware/plugin/step system, a DSL.
 - Exotic URI forms, IDN, happy eyeballs.
@@ -311,7 +364,7 @@ MVP (Phases 1–2):
 | 1 | URL, TCP, request encoding, response parsing, Content-Length | done |
 | 2 | HTTPS, errors, timeouts, tests | done |
 | 3 | `Transfer-Encoding: chunked`; redirects (301/302/303/307/308, `follow_redirects`, `max_redirects`) | done |
-| 4 | Keep-alive on a single connection (connect → req → resp → req → resp → close) | |
+| 4 | Keep-alive on a single connection (connect → req → resp → req → resp → close) | done |
 | 5 | Streaming responses | |
 | 6 | Optional: gzip/deflate, benchmarks vs other clients (as an experiment) | |
 
@@ -322,7 +375,7 @@ update this file and `CHANGELOG.md`.
 
 - **Educational (written by hand, clarity over speed):** request encoding,
   status line / header parsing, body framing, the receive loop, chunked
-  decoding, later keep-alive.
+  decoding, keep-alive.
 - **Production-oriented (must be correct and safe, never "simplified away"):**
   TLS verification and hostname checks, header injection protection,
   Content-Length conflict handling, size limits, timeouts, always closing
@@ -345,8 +398,8 @@ update this file and `CHANGELOG.md`.
 
 - Idiomatic Elixir: pattern matching, `with`, small private functions, binaries.
 - Functions first. No behaviours, protocols, GenServers or processes until a
-  concrete problem requires them. Keep-alive may justify a process; a one-shot
-  request does not.
+  concrete problem requires them. Keep-alive did not need one: a connection is
+  a value returned by every request.
 - No OOP-style layering, no "service/manager/adapter" modules, no patterns for
   their own sake.
 - `@spec` on public functions. `@moduledoc`/`@doc` explain the HTTP concept, not
@@ -363,6 +416,9 @@ update this file and `CHANGELOG.md`.
 - `test/fetch_test.exs` — end-to-end against a local raw TCP server
   (`test/support/test_server.ex`) that sends arbitrary bytes, including
   malformed, fragmented and slow responses.
+- `test/fetch/conn_test.exs` — keep-alive: requests counted per accepted
+  connection, reuse rules, idle connections closed by the server, errors,
+  HTTPS reuse.
 - `test/fetch/transport_test.exs` — DNS/connect errors and TLS against a local
   `:ssl` server with a generated CA: success, unknown CA, hostname mismatch,
   handshake timeout.

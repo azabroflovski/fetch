@@ -21,7 +21,8 @@ defmodule Fetch.Request do
     * `host` — derived from the URL
     * `content-length` — computed from the body
     * `transfer-encoding` — not supported for requests
-    * `connection` — always `close` until keep-alive exists
+    * `connection` — `close` when the connection will not be reused; absent
+      otherwise, because HTTP/1.1 connections are persistent by default
 
   Every header name and value is validated. A value containing `\\r\\n` could
   otherwise inject extra headers or a whole second request.
@@ -32,6 +33,8 @@ defmodule Fetch.Request do
   @type method :: :get | :head | :post | :put | :patch | :delete | :options
   @type headers :: [{String.t(), String.t()}]
 
+  @methods [:get, :head, :post, :put, :patch, :delete, :options]
+
   @managed_headers ["host", "content-length", "transfer-encoding", "connection"]
 
   # RFC 9110 §9.3: these methods define a meaning for request content, so a
@@ -40,9 +43,22 @@ defmodule Fetch.Request do
 
   @user_agent "fetch/#{Mix.Project.config()[:version]}"
 
-  @spec encode(method(), Fetch.URL.t(), headers(), iodata() | nil) ::
+  @doc "Raises `ArgumentError` unless `method` is one the client supports."
+  @spec check_method!(atom()) :: :ok
+  def check_method!(method) when method in @methods, do: :ok
+
+  def check_method!(method) do
+    raise ArgumentError,
+          "unsupported method #{inspect(method)}, expected one of #{inspect(@methods)}"
+  end
+
+  @doc """
+  Encodes a request. `keep_alive: false` adds `connection: close`, telling the
+  server the connection ends after this response.
+  """
+  @spec encode(method(), Fetch.URL.t(), headers(), iodata() | nil, boolean()) ::
           {:ok, iodata()} | {:error, {:request, term()}}
-  def encode(method, url, headers, body) do
+  def encode(method, url, headers, body, keep_alive) do
     with :ok <- validate_headers(headers) do
       {:ok,
        [
@@ -56,7 +72,7 @@ defmodule Fetch.Request do
          default_user_agent(headers),
          Enum.map(headers, fn {name, value} -> [name, ": ", value, "\r\n"] end),
          content_length(method, body),
-         "connection: close\r\n",
+         if(keep_alive, do: [], else: "connection: close\r\n"),
          "\r\n",
          body || ""
        ]}

@@ -264,6 +264,27 @@ defmodule Fetch.Parser do
   defp header_values(headers, name), do: for({^name, value} <- headers, do: value)
 
   @doc """
+  Returns true if the connection may carry another request after a response
+  with this version and headers (RFC 9112 §9.3).
+
+  HTTP/1.1 connections are persistent unless `connection: close` is sent.
+  HTTP/1.0 connections close by default; its old `connection: keep-alive`
+  extension is not supported.
+  """
+  @spec keep_alive?(String.t(), headers()) :: boolean()
+  def keep_alive?("HTTP/1.1", headers) do
+    options =
+      headers
+      |> header_values("connection")
+      |> split_list()
+      |> Enum.map(&String.downcase(&1, :ascii))
+
+    "close" not in options
+  end
+
+  def keep_alive?(_version, _headers), do: false
+
+  @doc """
   Returns true if `name` is an RFC 9110 token — the allowed syntax for header
   names: one or more of ``!#$%&'*+-.^_`|~``, digits and ASCII letters.
   """

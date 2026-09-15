@@ -300,6 +300,26 @@ defmodule Fetch.ParserTest do
     end
   end
 
+  describe "keep_alive?/2" do
+    test "HTTP/1.1 is persistent unless connection: close" do
+      assert Parser.keep_alive?("HTTP/1.1", [])
+      assert Parser.keep_alive?("HTTP/1.1", [{"connection", "keep-alive"}])
+      refute Parser.keep_alive?("HTTP/1.1", [{"connection", "close"}])
+      refute Parser.keep_alive?("HTTP/1.1", [{"connection", "Close"}])
+      refute Parser.keep_alive?("HTTP/1.1", [{"connection", "upgrade, close"}])
+
+      refute Parser.keep_alive?("HTTP/1.1", [
+               {"connection", "keep-alive"},
+               {"connection", "close"}
+             ])
+    end
+
+    test "HTTP/1.0 is never reused" do
+      refute Parser.keep_alive?("HTTP/1.0", [])
+      refute Parser.keep_alive?("HTTP/1.0", [{"connection", "keep-alive"}])
+    end
+  end
+
   test "token?/1 and field_value?/1" do
     assert Parser.token?("x-custom_header.1")
     assert Parser.token?("!#$%&'*+-.^_`|~")

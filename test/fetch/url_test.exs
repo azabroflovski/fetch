@@ -53,4 +53,23 @@ defmodule Fetch.URLTest do
     assert URL.parse("http://example.com/a b") == {:error, {:url, :invalid_url}}
     assert URL.parse("http://example.com/\r\nx") == {:error, {:url, :invalid_url}}
   end
+
+  describe "parse_target/1" do
+    test "path and query" do
+      assert URL.parse_target("/") == {:ok, "/"}
+      assert URL.parse_target("/users?page=2") == {:ok, "/users?page=2"}
+      assert URL.parse_target("/docs#section") == {:ok, "/docs"}
+      assert URL.parse_target("/a%20b") == {:ok, "/a%20b"}
+    end
+
+    test "a path starting with // is a path, not a host" do
+      assert URL.parse_target("//double/slash") == {:ok, "//double/slash"}
+    end
+
+    test "invalid" do
+      for path <- ["", "users", "http://other.test/", "/a b", "/\r\nx"] do
+        assert URL.parse_target(path) == {:error, {:url, {:invalid_path, path}}}
+      end
+    end
+  end
 end

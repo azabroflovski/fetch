@@ -45,6 +45,22 @@ defmodule Fetch.URL do
     end
   end
 
+  @doc """
+  Validates a request path such as `/users?page=2` for a connection that
+  already knows its origin. The fragment is dropped.
+  """
+  @spec parse_target(String.t()) :: {:ok, String.t()} | {:error, {:url, term()}}
+  def parse_target("/" <> _ = path) do
+    # Parsed behind a placeholder origin: on its own, "//double/slash" would be
+    # read as a host name.
+    case URI.new("http://localhost" <> path) do
+      {:ok, uri} -> {:ok, target(uri.path, uri.query)}
+      {:error, _part} -> {:error, {:url, {:invalid_path, path}}}
+    end
+  end
+
+  def parse_target(path), do: {:error, {:url, {:invalid_path, path}}}
+
   defp new_uri(url) do
     case URI.new(url) do
       {:ok, uri} -> {:ok, uri}

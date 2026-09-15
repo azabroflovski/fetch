@@ -143,6 +143,36 @@ A relative `location` is resolved against the current URL. When a redirect
 goes to another origin (scheme, host or port), `authorization`,
 `proxy-authorization` and `cookie` headers are not sent there.
 
+## Keep-alive
+
+`Fetch.get/2` and friends use a new connection for every request.
+`Fetch.Conn` keeps one connection open and sends requests over it one after
+another:
+
+```elixir
+{:ok, conn} = Fetch.Conn.new("http://localhost:4000")
+
+{:ok, conn, users} = Fetch.Conn.request(conn, :get, "/users")
+{:ok, conn, created} = Fetch.Conn.request(conn, :post, "/users", body: ~s({"name":"Jon Snow"}))
+
+Fetch.Conn.close(conn)
+```
+
+A connection is a value, not a process: every request returns the updated
+connection, keep using that one. Errors are `{:error, conn, {stage, reason}}`.
+
+- `new/2` does no IO; the first request connects.
+- The connection is closed after a response with `connection: close`, an
+  HTTP/1.0 response, a body delimited by close, or any error. The next request
+  connects again.
+- If the server closed the idle connection, the next request notices before
+  sending anything and reconnects.
+- If the connection breaks after a request was sent, you get the error. There
+  is no automatic retry: the server may already have handled the request.
+- `keep_alive: false` sends `connection: close` for the last request.
+- No redirects, no pooling, no pipelining. Use a connection from the process
+  that created it.
+
 ## Timeouts
 
 | option | default | |
@@ -156,7 +186,8 @@ then is not stopped by `:receive_timeout`.
 
 ## Limitations
 
-- New connection for every request, no keep-alive, no pooling.
+- `Fetch.get/2` and friends open a new connection per request; reuse needs
+  `Fetch.Conn`. No pooling, no pipelining, no retries.
 - The whole body is kept in memory. No streaming.
 - `chunked` is the only transfer coding. `gzip, chunked` and friends return
   `{:error, {:parse, {:unsupported_transfer_encoding, value}}}`.
@@ -168,9 +199,8 @@ then is not stopped by `:receive_timeout`.
 
 ## Roadmap
 
-1. Keep-alive on a single connection
-2. Streaming responses
-3. Optional: gzip/deflate, benchmarks
+1. Streaming responses
+2. Optional: gzip/deflate, benchmarks
 
 ## Why not Req/Finch?
 
@@ -183,6 +213,7 @@ are built on. Fetch exists to learn what those libraries do and why.
 
 ```bash
 mix run examples/get.exs https://www.erlang.org/
+mix run examples/keep_alive.exs https://www.erlang.org/ 10
 mix test                      # local servers only
 mix test --include external   # also talks to the internet
 ```
