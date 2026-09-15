@@ -29,3 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trailers validated and dropped, `:max_body_size` checked against declared
   chunk sizes before reading, 4 KiB chunk size line limit. Other transfer
   codings return `{:parse, {:unsupported_transfer_encoding, value}}`.
+- Redirects: 301, 302, 303, 307 and 308 are followed by default
+  (`:follow_redirects`, `:max_redirects` options, default 10). POST becomes GET
+  on 301/302, everything but HEAD becomes GET on 303, 307/308 keep method and
+  body. Relative `location` is resolved against the requested URL.
+  `authorization`, `proxy-authorization` and `cookie` are not sent to another
+  origin. New error stage `:redirect`.

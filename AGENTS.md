@@ -92,6 +92,7 @@ Fetch.request(method, url, opts)
   │    ├─ Fetch.Parser.body_framing/3     :none | {:content_length, n} | :chunked | :until_close
   │    └─ recv body                        (bounded body size)
   ├─ Fetch.Transport.close/1              always, success or error
+  ├─ Fetch.Redirect.next_request/2        3xx + location → start over with the next request
   └─ {:ok, %Fetch.Response{}} | {:error, {stage, reason}}
 ```
 
@@ -104,6 +105,7 @@ Fetch.request(method, url, opts)
 | `Fetch.Request` | pure | Encode a request to iodata; reject header injection. |
 | `Fetch.Parser` | pure | Parse status line, headers, chunk size lines and trailers; decide body framing. |
 | `Fetch.Response` | data | `%Fetch.Response{status, headers, body}` + `get_header/2`. |
+| `Fetch.Redirect` | pure | Decide whether a response is a redirect to follow and build the next request. |
 | `Fetch.Transport` | IO | DNS, TCP, TLS; `send/recv/close` over `{:gen_tcp, socket} \| {:ssl, socket}`. |
 
 Transport "polymorphism" is a tuple `{module, socket}` where module is
@@ -132,6 +134,7 @@ Every error that leaves any module is `{:error, {stage, reason}}`:
 | `:send` | `:closed`, `:timeout` |
 | `:recv` | `:closed`, `:timeout`, `:head_too_large`, `:body_too_large`, `:chunk_line_too_long`, `:trailers_too_large` |
 | `:parse` | `{:invalid_status_line, line}`, `{:invalid_header, line}`, `{:invalid_content_length, value}`, `{:unsupported_transfer_encoding, value}`, `{:invalid_chunk_size, line}`, `:invalid_chunk` |
+| `:redirect` | `:too_many_redirects`, `:multiple_locations`, `{:invalid_location, location}` |
 
 A timeout is always `{stage, :timeout}`, so `{:error, {_, :timeout}}` matches
 any of them.
@@ -250,6 +253,33 @@ string is passed and verified against `iPAddress` SANs.
 Never disable verification in tests. Tests use a local CA generated with
 `:public_key.pkix_test_data/1`.
 
+### 3.9 Redirects
+
+Options: `follow_redirects: true`, `max_redirects: 10` (defaults, like JS
+`fetch`). `Fetch.Redirect.next_request/2` is pure; the loop in `Fetch` sends
+each request on a new connection and returns the last response.
+
+| status | next request |
+| --- | --- |
+| 301, 302 | POST → GET without body; other methods unchanged |
+| 303 | everything but HEAD → GET without body |
+| 307, 308 | same method, headers and body |
+| other 3xx | not followed, returned as a response |
+
+- A 301/302/303/307/308 without `location` is returned as a response.
+  More than one `location` → `{:redirect, :multiple_locations}`.
+- `location` is resolved against the requested URL with `URI.merge/2`, then
+  validated by `Fetch.URL.parse/1`; failure → `{:redirect, {:invalid_location, location}}`.
+- When the method becomes GET: body dropped, and `content-type`,
+  `content-encoding`, `content-language`, `content-location` removed.
+- When the origin (scheme, host case-insensitive, port) changes:
+  `authorization`, `proxy-authorization`, `cookie` removed and never restored.
+- https → http redirects are followed (as browsers do); credentials are
+  dropped because the scheme is part of the origin.
+- More than `max_redirects` redirects → `{:redirect, :too_many_redirects}`.
+- The 3xx body is read fully before following (connection close anyway).
+- The response does not record the final URL (not needed yet).
+
 ## 4. Scope
 
 MVP (Phases 1–2):
@@ -280,7 +310,7 @@ MVP (Phases 1–2):
 | 0 | Research, design, this document | done |
 | 1 | URL, TCP, request encoding, response parsing, Content-Length | done |
 | 2 | HTTPS, errors, timeouts, tests | done |
-| 3 | `Transfer-Encoding: chunked` (done); redirects (301/302/303/307/308, `follow_redirects`, `max_redirects`) | in progress |
+| 3 | `Transfer-Encoding: chunked`; redirects (301/302/303/307/308, `follow_redirects`, `max_redirects`) | done |
 | 4 | Keep-alive on a single connection (connect → req → resp → req → resp → close) | |
 | 5 | Streaming responses | |
 | 6 | Optional: gzip/deflate, benchmarks vs other clients (as an experiment) | |

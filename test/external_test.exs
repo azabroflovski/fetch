@@ -17,6 +17,10 @@ defmodule Fetch.ExternalTest do
     assert response.body =~ "Example Domain"
   end
 
+  test "follows an http → https redirect" do
+    assert {:ok, %Fetch.Response{status: 200}} = Fetch.get("http://www.erlang.org/")
+  end
+
   test "HTTPS HEAD to example.com" do
     assert {:ok, %Fetch.Response{status: 200, body: ""}} = Fetch.head("https://example.com")
   end

@@ -5,14 +5,17 @@ defmodule FetchTest do
 
   doctest Fetch.Response
 
-  # Starts a server that captures the request, sends it to the test process and
-  # replies with `response` (a binary, or a list of chunks sent separately).
+  # Starts a server that captures each request, sends it to the test process
+  # and replies with `response`: a binary, a list of chunks sent separately, or
+  # a function from the request to one of those.
   defp serve(response) do
     test = self()
 
     port =
       TestServer.start(fn {mod, socket} = conn ->
-        send(test, {:request, TestServer.read_request(conn)})
+        request = TestServer.read_request(conn)
+        send(test, {:request, request})
+        response = if is_function(response), do: response.(request), else: response
 
         # The client may close early (e.g. on a size limit), so sends may fail.
         for chunk <- List.wrap(response) do
@@ -23,6 +26,9 @@ defmodule FetchTest do
 
     "http://localhost:#{port}"
   end
+
+  defp redirect_to(location, status \\ 302),
+    do: "HTTP/1.1 #{status} Redirect\r\nLocation: #{location}\r\nContent-Length: 0\r\n\r\n"
 
   describe "request and response" do
     test "GET sends a well-formed request and parses the response" do
@@ -245,6 +251,126 @@ defmodule FetchTest do
 
       assert Fetch.get("http://localhost:#{port}", receive_timeout: 50) ==
                {:error, {:recv, :timeout}}
+    end
+  end
+
+  describe "redirects" do
+    test "follows a relative redirect" do
+      url =
+        serve(fn
+          "GET /start " <> _ -> redirect_to("/end")
+          "GET /end " <> _ -> "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone"
+        end)
+
+      assert {:ok, %Response{status: 200, body: "done"}} = Fetch.get(url <> "/start")
+      assert_received {:request, "GET /start HTTP/1.1\r\n" <> _}
+      assert_received {:request, "GET /end HTTP/1.1\r\n" <> _}
+    end
+
+    test "a chain of redirects" do
+      url =
+        serve(fn
+          "GET /1 " <> _ -> redirect_to("/2", 301)
+          "GET /2 " <> _ -> redirect_to("/3", 308)
+          "GET /3 " <> _ -> "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone"
+        end)
+
+      assert {:ok, %Response{status: 200, body: "done"}} = Fetch.get(url <> "/1")
+    end
+
+    test "POST after 303 becomes GET without body" do
+      url =
+        serve(fn
+          "POST /form " <> _ -> redirect_to("/result", 303)
+          "GET /result " <> _ -> "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+        end)
+
+      assert {:ok, %Response{status: 200, body: "ok"}} =
+               Fetch.post(url <> "/form",
+                 headers: [{"content-type", "application/json"}],
+                 body: ~s({"name":"Jon Snow"})
+               )
+
+      assert_received {:request, "POST /form HTTP/1.1\r\n" <> _}
+      assert_received {:request, "GET /result HTTP/1.1\r\n" <> request}
+      refute request =~ "content-type"
+      refute request =~ "content-length"
+      assert String.ends_with?(request, "connection: close\r\n\r\n")
+    end
+
+    test "307 repeats the method and the body" do
+      url =
+        serve(fn
+          "PUT /old " <> _ -> redirect_to("/new", 307)
+          "PUT /new " <> _ -> "HTTP/1.1 204 No Content\r\n\r\n"
+        end)
+
+      assert {:ok, %Response{status: 204}} = Fetch.put(url <> "/old", body: "data")
+      assert_received {:request, "PUT /old HTTP/1.1\r\n" <> _}
+      assert_received {:request, "PUT /new HTTP/1.1\r\n" <> request}
+      assert String.ends_with?(request, "content-length: 4\r\nconnection: close\r\n\r\ndata")
+    end
+
+    test "follow_redirects: false returns the redirect response" do
+      url = serve(redirect_to("/elsewhere", 301))
+
+      assert {:ok, %Response{status: 301} = response} = Fetch.get(url, follow_redirects: false)
+      assert Response.get_header(response, "location") == ["/elsewhere"]
+    end
+
+    test "a redirect status without location is returned as is" do
+      url = serve("HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n")
+      assert {:ok, %Response{status: 302}} = Fetch.get(url)
+    end
+
+    test "a redirect loop stops after max_redirects" do
+      url = serve(redirect_to("/again"))
+
+      assert Fetch.get(url, max_redirects: 3) == {:error, {:redirect, :too_many_redirects}}
+
+      for _ <- 1..4, do: assert_received({:request, _})
+      refute_received {:request, _}
+    end
+
+    test "max_redirects: 0 fails on the first redirect" do
+      url = serve(redirect_to("/again"))
+
+      assert Fetch.get(url, max_redirects: 0) == {:error, {:redirect, :too_many_redirects}}
+      assert_received {:request, _}
+      refute_received {:request, _}
+    end
+
+    test "credentials are not sent to another origin" do
+      other = serve("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nother")
+
+      url =
+        serve(fn
+          "GET /same " <> _ -> redirect_to("/cross")
+          "GET /cross " <> _ -> redirect_to(other <> "/landing")
+        end)
+
+      headers = [{"authorization", "Bearer secret"}, {"cookie", "a=1"}, {"x-custom", "kept"}]
+      assert {:ok, %Response{body: "other"}} = Fetch.get(url <> "/same", headers: headers)
+
+      assert_received {:request, "GET /same " <> first}
+      assert_received {:request, "GET /cross " <> second}
+      assert_received {:request, "GET /landing " <> third}
+
+      for request <- [first, second] do
+        assert request =~ "\r\nauthorization: Bearer secret\r\n"
+        assert request =~ "\r\ncookie: a=1\r\n"
+      end
+
+      refute third =~ "authorization"
+      refute third =~ "cookie"
+      assert third =~ "\r\nx-custom: kept\r\n"
+    end
+
+    test "redirect to an unsupported scheme" do
+      url = serve(redirect_to("ftp://files.test/x"))
+
+      assert Fetch.get(url) ==
+               {:error, {:redirect, {:invalid_location, "ftp://files.test/x"}}}
     end
   end
 

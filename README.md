@@ -103,10 +103,12 @@ The body is read whole, whether it is framed by `content-length`,
 {:error, {:tls, {:tls_alert, {:unknown_ca, _}}}}
 {:error, {:recv, :timeout}}
 {:error, {:parse, {:invalid_header, "Content-Length : 5"}}}
+{:error, {:redirect, :too_many_redirects}}
 ```
 
 Stages: `:url`, `:request`, `:dns`, `:connect`, `:tls`, `:send`, `:recv`,
-`:parse`. Unknown options and unsupported methods raise `ArgumentError`.
+`:parse`, `:redirect`. Unknown options and unsupported methods raise
+`ArgumentError`.
 
 ## HTTPS
 
@@ -120,6 +122,26 @@ Extra `:ssl` options are merged over these defaults, e.g. a private CA:
 ```elixir
 Fetch.get("https://internal.test/", ssl: [cacertfile: "priv/ca.pem"])
 ```
+
+## Redirects
+
+301, 302, 303, 307 and 308 are followed by default, at most 10 times:
+
+```elixir
+Fetch.get("http://www.erlang.org/")          # 301 → https://www.erlang.org/
+Fetch.get(url, follow_redirects: false)      # returns the 3xx response itself
+Fetch.get(url, max_redirects: 3)             # {:error, {:redirect, :too_many_redirects}}
+```
+
+| status | next request |
+| --- | --- |
+| 301, 302 | POST becomes GET without body, other methods are kept |
+| 303 | GET without body (HEAD stays HEAD) |
+| 307, 308 | same method, headers and body |
+
+A relative `location` is resolved against the current URL. When a redirect
+goes to another origin (scheme, host or port), `authorization`,
+`proxy-authorization` and `cookie` headers are not sent there.
 
 ## Timeouts
 
@@ -139,15 +161,16 @@ then is not stopped by `:receive_timeout`.
 - `chunked` is the only transfer coding. `gzip, chunked` and friends return
   `{:error, {:parse, {:unsupported_transfer_encoding, value}}}`.
 - Trailer fields of chunked responses are validated and dropped.
-- No redirects, compression, cookies, proxies, retries.
+- No compression, cookies, proxies, retries.
+- Every redirect opens a new connection. The response does not say which URL
+  it finally came from.
 - HTTP/1.1 only.
 
 ## Roadmap
 
-1. Redirects
-2. Keep-alive on a single connection
-3. Streaming responses
-4. Optional: gzip/deflate, benchmarks
+1. Keep-alive on a single connection
+2. Streaming responses
+3. Optional: gzip/deflate, benchmarks
 
 ## Why not Req/Finch?
 

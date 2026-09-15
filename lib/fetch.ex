@@ -23,18 +23,22 @@ defmodule Fetch do
       `{:recv, :body_too_large}`. Default 16 MiB.
     * `:ssl` — extra `:ssl` client options merged over the secure defaults,
       e.g. `cacerts: [der]` for a private CA.
+    * `:follow_redirects` — follow 301, 302, 303, 307 and 308 responses, see
+      `Fetch.Redirect`. Default `true`.
+    * `:max_redirects` — redirects to follow before failing with
+      `{:redirect, :too_many_redirects}`. Default `10`.
 
   ## Errors
 
   All errors are `{:error, {stage, reason}}`, where stage is one of `:url`,
-  `:request`, `:dns`, `:connect`, `:tls`, `:send`, `:recv`, `:parse`.
-  Timeouts are `{stage, :timeout}`.
+  `:request`, `:dns`, `:connect`, `:tls`, `:send`, `:recv`, `:parse`,
+  `:redirect`. Timeouts are `{stage, :timeout}`.
 
   Invalid options or an unsupported method raise `ArgumentError`: those are
   bugs in the calling code, not runtime conditions.
   """
 
-  alias Fetch.{Parser, Request, Response, Transport, URL}
+  alias Fetch.{Parser, Redirect, Request, Response, Transport, URL}
 
   @methods [:get, :head, :post, :put, :patch, :delete, :options]
 
@@ -44,7 +48,9 @@ defmodule Fetch do
     connect_timeout: 5_000,
     receive_timeout: 15_000,
     max_body_size: 16 * 1024 * 1024,
-    ssl: []
+    ssl: [],
+    follow_redirects: true,
+    max_redirects: 10
   ]
 
   # A head bigger than this is not a normal response.
@@ -53,7 +59,8 @@ defmodule Fetch do
   # Longest chunk size line (hex size + extensions) we wait for.
   @max_chunk_line 4 * 1024
 
-  @type error_stage :: :url | :request | :dns | :connect | :tls | :send | :recv | :parse
+  @type error_stage ::
+          :url | :request | :dns | :connect | :tls | :send | :recv | :parse | :redirect
   @type error :: {:error, {error_stage(), term()}}
 
   @doc "Sends a GET request. See `request/3`."
@@ -89,7 +96,9 @@ defmodule Fetch do
       )
 
   Any HTTP status is `{:ok, response}` — a 404 is a valid response, not an
-  error. See the module docs for options and errors.
+  error. Redirects are followed unless `follow_redirects: false`; the
+  response is the one from the last request. See the module docs for options
+  and errors.
   """
   @spec request(Request.method(), String.t(), keyword()) :: {:ok, Response.t()} | error()
   def request(method, url, opts \\ []) do
@@ -100,8 +109,28 @@ defmodule Fetch do
 
     opts = Keyword.validate!(opts, @default_options)
 
-    with {:ok, url} <- URL.parse(url),
-         {:ok, data} <- Request.encode(method, url, opts[:headers], opts[:body]),
+    with {:ok, url} <- URL.parse(url) do
+      request = %{method: method, url: url, headers: opts[:headers], body: opts[:body]}
+      run(request, opts, opts[:max_redirects])
+    end
+  end
+
+  # Every redirect is a new request on a new connection.
+  defp run(request, opts, redirects_left) do
+    with {:ok, response} <- send_request(request, opts) do
+      next = if opts[:follow_redirects], do: Redirect.next_request(request, response), else: :none
+
+      case next do
+        :none -> {:ok, response}
+        {:ok, _next} when redirects_left < 1 -> {:error, {:redirect, :too_many_redirects}}
+        {:ok, next} -> run(next, opts, redirects_left - 1)
+        {:error, _} = error -> error
+      end
+    end
+  end
+
+  defp send_request(%{method: method, url: url} = request, opts) do
+    with {:ok, data} <- Request.encode(method, url, request.headers, request.body),
          {:ok, transport} <- Transport.connect(url, opts) do
       try do
         with :ok <- Transport.send(transport, data) do
